@@ -1,12 +1,24 @@
-import socket
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
 from datetime import datetime
+import urllib.request
+import urllib.error
+import json
+import time
 
 
-HOST = "127.0.0.1"
-PORT = 5555
+SERVER_URL = "https://vibecoding-workshop-production.up.railway.app"
+POLL_INTERVAL = 2  # seconds between inbox polls
+
+
+def http(method: str, path: str, body: dict | None = None) -> dict:
+    url = SERVER_URL + path
+    data = json.dumps(body).encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 class ChatClient:
@@ -15,8 +27,8 @@ class ChatClient:
         self.root.title("Real-time Chat Client")
         self.root.resizable(False, False)
 
-        self.client_socket: socket.socket | None = None
         self.connected = False
+        self._poll_thread: threading.Thread | None = None
 
         self._build_ui()
 
@@ -33,15 +45,9 @@ class ChatClient:
         self.name_entry.insert(0, "Guest")
         self.name_entry.pack(side=tk.LEFT, padx=(4, 12))
 
-        tk.Label(top_frame, text="Host:", font=("Arial", 10)).pack(side=tk.LEFT)
-        self.host_entry = tk.Entry(top_frame, width=13, font=("Arial", 10))
-        self.host_entry.insert(0, HOST)
-        self.host_entry.pack(side=tk.LEFT, padx=(4, 4))
-
-        tk.Label(top_frame, text="Port:", font=("Arial", 10)).pack(side=tk.LEFT)
-        self.port_entry = tk.Entry(top_frame, width=6, font=("Arial", 10))
-        self.port_entry.insert(0, str(PORT))
-        self.port_entry.pack(side=tk.LEFT, padx=(4, 12))
+        tk.Label(top_frame, text="To:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+        self.to_entry = tk.Entry(top_frame, width=18, font=("Arial", 10))
+        self.to_entry.pack(side=tk.LEFT, padx=(4, 12))
 
         self.connect_btn = tk.Button(
             top_frame, text="Connect", width=9,
@@ -87,7 +93,6 @@ class ChatClient:
             font=("Arial", 9), fg="gray", anchor=tk.W
         ).pack(fill=tk.X, padx=10, pady=(0, 6))
 
-        # Safe exit
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ──────────────────────────────────────────────
@@ -100,40 +105,29 @@ class ChatClient:
             self._connect()
 
     def _connect(self):
-        host = self.host_entry.get().strip()
+        user_id = self.name_entry.get().strip() or "Guest"
         try:
-            port = int(self.port_entry.get().strip())
-        except ValueError:
-            messagebox.showerror("Error", "Port must be an integer.")
-            return
-
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((host, port))
-        except OSError as e:
+            result = http("POST", f"/signin/{user_id}")
+            self._log_system(result.get("message", "Signed in"))
+        except Exception as e:
             messagebox.showerror("Connection Failed", str(e))
-            self.client_socket = None
             return
 
         self.connected = True
         self._set_ui_connected(True)
-        self._log_system(f"Connected to {host}:{port}")
 
-        # Background receiver thread (daemon → dies with main thread)
-        recv_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        recv_thread.start()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
 
-    def _disconnect(self, notify_server=True):
+    def _disconnect(self):
         self.connected = False
-        if self.client_socket:
-            try:
-                self.client_socket.shutdown(socket.SHUT_RDWR)
-                self.client_socket.close()
-            except OSError:
-                pass
-            self.client_socket = None
+        user_id = self.name_entry.get().strip() or "Guest"
+        try:
+            result = http("POST", f"/signout/{user_id}")
+            self._log_system(result.get("message", "Signed out"))
+        except Exception as e:
+            self._log_system(f"Sign out error: {e}")
         self._set_ui_connected(False)
-        self._log_system("Disconnected.")
 
     def _set_ui_connected(self, connected: bool):
         state = tk.NORMAL if connected else tk.DISABLED
@@ -151,41 +145,52 @@ class ChatClient:
     # Messaging
     # ──────────────────────────────────────────────
     def _send_message(self):
-        if not self.connected or not self.client_socket:
+        if not self.connected:
             return
 
         text = self.msg_entry.get().strip()
         if not text:
             return
 
-        name = self.name_entry.get().strip() or "Guest"
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        message = f"[{timestamp}] {name}: {text}"
+        sender_id = self.name_entry.get().strip() or "Guest"
+        receiver_id = self.to_entry.get().strip()
+        if not receiver_id:
+            messagebox.showwarning("Missing recipient", "Please enter a name in the 'To:' field.")
+            return
 
-        try:
-            self.client_socket.sendall(message.encode("utf-8"))
-            self.msg_entry.delete(0, tk.END)
-        except OSError as e:
-            self._log_system(f"Send error: {e}")
-            self._disconnect()
+        timestamp = datetime.now().isoformat()
 
-    def _receive_loop(self):
-        """Runs in a background thread. Pushes received data to the UI thread."""
+        def do_send():
+            try:
+                result = http("POST", f"/message/{sender_id}", {
+                    "receiver_id": receiver_id,
+                    "message_text": text,
+                    "current_timestamp": timestamp,
+                })
+                self.root.after(0, self._log_system, result.get("message", ""))
+            except Exception as e:
+                self.root.after(0, self._log_system, f"Send error: {e}")
+
+        self.msg_entry.delete(0, tk.END)
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._append_message(f"[{ts}] You → {receiver_id}: {text}")
+        threading.Thread(target=do_send, daemon=True).start()
+
+    def _poll_loop(self):
+        user_id = self.name_entry.get().strip() or "Guest"
         while self.connected:
             try:
-                data = self.client_socket.recv(4096)
-                if not data:
-                    # Server closed the connection
-                    self.root.after(0, lambda: self._log_system("Server closed the connection."))
-                    self.root.after(0, self._disconnect)
-                    break
-                message = data.decode("utf-8")
-                self.root.after(0, self._append_message, message)
-            except OSError:
+                result = http("GET", f"/messages/{user_id}")
+                messages = result.get("messages", [])
+                for msg in messages:
+                    ts = msg.get("current_timestamp", "")
+                    sender = msg.get("sender_id", "?")
+                    text = msg.get("message_text", "")
+                    self.root.after(0, self._append_message, f"[{ts}] {sender}: {text}")
+            except Exception as e:
                 if self.connected:
-                    self.root.after(0, lambda: self._log_system("Connection lost."))
-                    self.root.after(0, self._disconnect)
-                break
+                    self.root.after(0, self._log_system, f"Poll error: {e}")
+            time.sleep(POLL_INTERVAL)
 
     # ──────────────────────────────────────────────
     # Chat display helpers
