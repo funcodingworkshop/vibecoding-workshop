@@ -187,6 +187,15 @@ class ChatClient:
                     sender = msg.get("sender_id", "?")
                     text = msg.get("message_text", "")
                     self.root.after(0, self._append_message, f"[{ts}] {sender}: {text}")
+            except urllib.error.HTTPError as e:
+                if self.connected and e.code == 400:
+                    # Server lost our session (restart/redeploy), re-sign in silently
+                    try:
+                        http("POST", f"/signin/{user_id}")
+                    except Exception:
+                        pass
+                elif self.connected:
+                    self.root.after(0, self._log_system, f"Poll error: {e}")
             except Exception as e:
                 if self.connected:
                     self.root.after(0, self._log_system, f"Poll error: {e}")
